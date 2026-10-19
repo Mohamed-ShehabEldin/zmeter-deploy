@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.DS_Store
+# Vendor API wheels are supplied locally, not redistributed.
+*.whl

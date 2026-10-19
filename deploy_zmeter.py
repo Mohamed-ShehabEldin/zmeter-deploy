@@ -2,7 +2,8 @@
 
 This standard-library-only tool installs immutable assets from published
 ``lictailer/zmeter`` GitHub releases. It never launches ZMeter, imports device
-modules, installs drivers, or accesses hardware.
+modules, installs OS drivers, or accesses hardware. The optional local attoDRY
+Python API is installed only with explicit operator consent.
 """
 
 from __future__ import annotations
@@ -36,6 +37,11 @@ COPY_CHUNK_SIZE = 128 * 1024
 DISK_SPACE_MARGIN = 256 * 1024 * 1024
 MAX_RELEASE_PAGES = 10
 MANIFEST_NAME = "deployment-manifest.json"
+ATTO_DEVICE_VENDOR_WHEEL = "api_atto-device-python_1.0.12.whl"
+ATTO_DEVICE_INSTALL_WHEEL = "atto_device-1.12.0-py3-none-any.whl"
+ATTO_DEVICE_WHEEL_SHA256 = (
+    "b1c0a7504e532105a5936bdd140054de7d1d2338b322bf12c21b94a7b9a8c5e6"
+)
 LEGACY_STABLE_TAG = "v0.10.0"
 STABLE_TAG = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 BETA_TAG = re.compile(
@@ -995,8 +1001,108 @@ def build_conda_command(conda_executable, environment, environment_file):
     return tuple(command)
 
 
-def run_conda_command(command, runner=subprocess.run):
-    print("\nConda output:\n")
+def build_conda_pip_install_command(conda_executable, environment, wheel_path):
+    return (
+        str(conda_executable),
+        "run",
+        "--name",
+        environment.name,
+        "python",
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        "--no-index",
+        "--no-deps",
+        str(wheel_path),
+    )
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(COPY_CHUNK_SIZE):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _package_contains_attodry(package):
+    return any(
+        _safe_member_name(info).casefold().startswith("devices/attodry/")
+        for info in package.members
+    )
+
+
+def find_attodry_vendor_wheel(installer_directory):
+    installer_directory = Path(installer_directory).resolve()
+    roots = (installer_directory, installer_directory.parent)
+    relative_candidates = (
+        Path(ATTO_DEVICE_VENDOR_WHEEL),
+        Path(ATTO_DEVICE_INSTALL_WHEEL),
+        Path("Attocube")
+        / "u drive"
+        / "Software"
+        / "API"
+        / ATTO_DEVICE_VENDOR_WHEEL,
+        Path("Attocube")
+        / "u drive"
+        / "Software"
+        / "API"
+        / ATTO_DEVICE_INSTALL_WHEEL,
+    )
+    candidates = tuple(
+        dict.fromkeys(root / relative for root in roots for relative in relative_candidates)
+    )
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        if _file_sha256(candidate) != ATTO_DEVICE_WHEEL_SHA256:
+            raise ValueError(
+                "The local attoDRY Python wheel failed SHA-256 verification: "
+                f"{candidate}"
+            )
+        return candidate
+    searched = "\n".join(f"  - {candidate}" for candidate in candidates)
+    raise FileNotFoundError(
+        "This ZMeter release includes the attoDRY driver, but its vendor-supplied "
+        "Python wheel was not found. Copy api_atto-device-python_1.0.12.whl "
+        "beside deploy_zmeter.py or keep the Attocube/u drive folder beside it. "
+        f"Searched:\n{searched}"
+    )
+
+
+def stage_attodry_vendor_wheel(source, work_directory):
+    destination = Path(work_directory) / ATTO_DEVICE_INSTALL_WHEEL
+    shutil.copyfile(source, destination)
+    if _file_sha256(destination) != ATTO_DEVICE_WHEEL_SHA256:
+        destination.unlink(missing_ok=True)
+        raise ValueError("The staged attoDRY Python wheel failed SHA-256 verification.")
+    return destination
+
+
+def select_attodry_vendor_wheel(installer_directory):
+    """Opt-in before Conda mutation; a missing optional API never blocks others."""
+    print("\nThis release supports the optional attoDRY2100 device.")
+    print("Its vendor Python API is not needed for other devices.")
+    answer = _read("Will you use attoDRY and install its Python API? [y/N]: ")
+    if answer.strip().casefold() not in {"y", "yes"}:
+        print("Skipping attoDRY API. You can rerun environment setup to add it later.")
+        return None
+    try:
+        return find_attodry_vendor_wheel(installer_directory)
+    except FileNotFoundError:
+        print("Use the Python wheel supplied by attocube with your controller.")
+        supplied = _read("Full path to the vendor .whl (Enter to cancel setup): ").strip().strip('"')
+        if not supplied:
+            raise UserCancelled
+        source = Path(supplied).expanduser()
+        if not source.is_file() or _file_sha256(source) != ATTO_DEVICE_WHEEL_SHA256:
+            raise ValueError("The selected attoDRY Python wheel is missing or failed SHA-256 verification.")
+        return source
+
+
+def run_conda_command(command, runner=subprocess.run, heading="Conda output"):
+    print(f"\n{heading}:\n")
     try:
         result = runner(list(command), check=False)
     except KeyboardInterrupt as error:
@@ -1025,21 +1131,41 @@ def execute_installation(client, release, destination, progress=None):
 
 
 def execute_environment_setup(
-    client, release, conda_executable, environment, progress=None, runner=subprocess.run
+    client,
+    release,
+    conda_executable,
+    environment,
+    progress=None,
+    runner=subprocess.run,
+    installer_directory=None,
 ):
     display = progress or ConsoleProgress()
+    installer_directory = installer_directory or Path(__file__).resolve().parent
     with tempfile.TemporaryDirectory(prefix="zmeter-environment-") as temporary:
         work_directory = Path(temporary)
         archive_path = work_directory / release.asset.name
         check_download_space(work_directory, release.asset.size)
-        display.stage(1, 3, "Downloading release")
+        display.stage(1, 4, "Downloading release")
         download_release_asset(client, release, archive_path, display.update)
-        display.stage(2, 3, "Verifying environment")
+        display.stage(2, 4, "Verifying environment")
         tagged_commit = client.resolve_tag_commit(release.tag)
         package = verify_release_package(archive_path, release, tagged_commit, work_directory)
-        display.stage(3, 3, "Running Conda")
+        attodry_wheel = None
+        if _package_contains_attodry(package):
+            source_wheel = select_attodry_vendor_wheel(installer_directory)
+            if source_wheel is not None:
+                attodry_wheel = stage_attodry_vendor_wheel(source_wheel, work_directory)
+        display.stage(3, 4, "Running Conda")
         command = build_conda_command(conda_executable, environment, package.environment_path)
         run_conda_command(command, runner)
+        if attodry_wheel is not None:
+            display.stage(4, 4, "Installing verified attoDRY Python API")
+            command = build_conda_pip_install_command(
+                conda_executable, environment, attodry_wheel
+            )
+            run_conda_command(command, runner, "attoDRY package installation output")
+        else:
+            display.stage(4, 4, "Finished")
     print(f"\nEnvironment {environment.name} is ready.")
 
 
